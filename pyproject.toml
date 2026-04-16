@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spec-fitter"
+version = "0.1.0"
+description = "Interactive GUI for 2D astronomical spectrum background subtraction and 1D optimal extraction"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Chengzhang Jiang", email = "yifany690@gmail.com" },
+]
+requires-python = ">=3.10"
+keywords = ["astronomy", "spectroscopy", "FITS", "GUI", "background subtraction", "optimal extraction"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+    "astropy>=5.3",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+lacosmic = [
+    "astroscrappy>=1.1",
+]
+
+[project.scripts]
+spec-fitter = "spectrum_gui:main"
+
+[project.urls]
+Repository = "https://github.com/PLACEHOLDER/spec_fitter"
+"Bug Tracker" = "https://github.com/PLACEHOLDER/spec_fitter/issues"
+
+[tool.setuptools]
+py-modules = ["spectrum_gui"]

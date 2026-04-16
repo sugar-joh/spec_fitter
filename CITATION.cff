@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software in your research, please cite it as below."
+type: software
+title: "spec-fitter: Interactive GUI for 2D Astronomical Spectrum Reduction"
+abstract: >
+  spec-fitter is an interactive tkinter-based GUI tool for astronomers.
+  It supports row-by-row Chebyshev polynomial background subtraction of
+  2D FITS spectra, bad-pixel masking (manual, file-based, and cosmic-ray
+  detection via astroscrappy), and optimal 1D spectral extraction using a
+  Gauss-Hermite spatial profile model. Results are saved as standard FITS
+  files.
+authors:
+  - family-names: "Jiang"
+    given-names: "Chengzhang"
+    email: "yifany690@gmail.com"
+version: "0.1.0"
+date-released: "2025-04-15"
+license: MIT
+repository-code: "https://github.com/PLACEHOLDER/spec_fitter"
+keywords:
+  - astronomy
+  - spectroscopy
+  - FITS
+  - background subtraction
+  - optimal extraction
+  - GUI

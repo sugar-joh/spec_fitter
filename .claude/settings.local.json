@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import numpy; print\\('numpy', numpy.__version__\\)\")",
+      "Bash(python3 -c \"import matplotlib; print\\('matplotlib', matplotlib.__version__\\)\")",
+      "Bash(python3 -c \"import astropy; print\\('astropy', astropy.__version__\\)\")",
+      "Bash(python3 -c \"import scipy; print\\('scipy', scipy.__version__\\)\")",
+      "Bash(python3 -c \"import astroscrappy; print\\('astroscrappy', astroscrappy.__version__\\)\")",
+      "Bash(pip install *)",
+      "Bash(spec-fitter --help)"
+    ]
+  }
+}

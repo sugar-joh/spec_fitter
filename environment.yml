@@ -1,0 +1,14 @@
+name: spec_fitter
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.10
+  - numpy>=1.24
+  - matplotlib>=3.7
+  - astropy>=5.3
+  - scipy>=1.10
+  - tk  # Tcl/Tk backend for matplotlib and the GUI
+  - pip
+  - pip:
+      - astroscrappy>=1.1  # optional: cosmic ray removal (requires a C compiler)
