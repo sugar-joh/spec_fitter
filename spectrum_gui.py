@@ -215,7 +215,9 @@ class SpectrumApp(tk.Tk):
         self._extr_running: bool = False
         self._extr_after_id = None
         self._extr_row_idx: int = 0
-        self._extr_click_state: int = 0   # 0=idle, 1=await col1, 2=await col2
+        self._region_click_state: int = 0  # 0=idle, 1=await col1, 2=await col2 (shared)
+        self._region_click_lo: Optional[int] = None  # first column clicked during region selection
+        self._fit_regions: list = []       # list of (start_col, stop_col) for background fitting
         self._extr_vlines: list = []       # yellow aperture lines on image
         self.profile_params_rows: Optional[list] = None   # per-row GH fit params (list of dicts or None)
         self.profile_fit_cache: Optional[list] = None    # per-row cached fit result dict (invalidated on mask change)
@@ -373,6 +375,43 @@ class SpectrumApp(tk.Tk):
         canvas.mpl_connect("motion_notify_event", self._on_fit_motion)
         canvas.mpl_connect("key_press_event", self._on_fit_key)
 
+    # ------------------------------------------------------------------
+    # Help-button factory
+    # ------------------------------------------------------------------
+
+    def _make_help_btn(self, parent: tk.Widget, tip_text: str) -> ttk.Button:
+        """Return a small '?' button that shows a dismissible popup on click."""
+        btn = ttk.Button(parent, text="?", width=2)
+
+        def _show(event=None, _btn=btn, _text=tip_text):
+            popup = tk.Toplevel(self)
+            popup.overrideredirect(True)
+            popup.attributes("-topmost", True)
+            x = _btn.winfo_rootx() + _btn.winfo_width() + 4
+            y = _btn.winfo_rooty()
+            lbl = tk.Label(popup, text=_text, justify=tk.LEFT,
+                           bg="#fffbe6", fg="#333333",
+                           relief=tk.SOLID, bd=1,
+                           font=("TkDefaultFont", 10),
+                           padx=6, pady=4, wraplength=320)
+            lbl.pack()
+            popup.geometry(f"+{x}+{y}")
+            popup.update_idletasks()
+
+            def _close(_p=popup):
+                try:
+                    _p.destroy()
+                except tk.TclError:
+                    pass
+
+            popup.bind("<FocusOut>", lambda e: _close())
+            popup.bind("<Button-1>", lambda e: _close())
+            self.bind("<Button-1>", lambda e: _close(), add="+")
+            popup.focus_set()
+
+        btn.configure(command=_show)
+        return btn
+
     def _build_params_panel(self, parent):
         nb = ttk.Notebook(parent)
         nb.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
@@ -381,8 +420,12 @@ class SpectrumApp(tk.Tk):
         nb.add(nav_tab, text="Navigate & Fit")
         self._build_nav_tab(nav_tab)
 
+        common_tab = ttk.Frame(nb, padding=6)
+        nb.add(common_tab, text="Common")
+        self._build_common_tab(common_tab)
+
         fit_tab = ttk.Frame(nb, padding=6)
-        nb.add(fit_tab, text="Fit Parameters")
+        nb.add(fit_tab, text="Background")
         self._build_fit_params_tab(fit_tab)
 
         mask_tab = ttk.Frame(nb, padding=6)
@@ -466,8 +509,9 @@ class SpectrumApp(tk.Tk):
         r1b.pack(fill=tk.X, pady=(0, 3))
         ttk.Button(r1b, text="Centroid Plot",
                    command=self._show_centroid_plot).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Label(r1b, text="plot profile centroid vs row  (click to navigate)",
-                  font=("TkDefaultFont", 8), foreground="gray").pack(side=tk.LEFT)
+        self._make_help_btn(r1b,
+            "Plot profile centroid position vs row.\n"
+            "Click any point in the plot to navigate to that row.").pack(side=tk.LEFT)
 
         # Row 2 — options / toggles
         r2 = ttk.Frame(act)
@@ -490,60 +534,114 @@ class SpectrumApp(tk.Tk):
                    command=self._restart_results).pack(anchor=tk.W)
 
         # Keyboard shortcuts hint
-        hint = ttk.LabelFrame(parent, text="Keyboard Shortcuts", padding=4)
-        hint.pack(fill=tk.X, pady=(0, 4))
-        for line in ["← / → or ↑ / ↓  navigate rows", "F  fit current row", "B  toggle bad pixel mode", "D  toggle bad pixel under cursor"]:
-            ttk.Label(hint, text=line, font=("TkDefaultFont", 8), foreground="gray").pack(anchor=tk.W)
+        shortcuts_row = ttk.Frame(parent)
+        shortcuts_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(shortcuts_row, text="Keyboard shortcuts").pack(side=tk.LEFT, padx=(0, 4))
+        self._make_help_btn(shortcuts_row,
+            "← / → or ↑ / ↓   navigate rows\n"
+            "F   fit current row\n"
+            "B   toggle bad pixel mode\n"
+            "D   toggle bad pixel under cursor").pack(side=tk.LEFT)
 
-    def _build_fit_params_tab(self, parent):
+    def _build_common_tab(self, parent):
         parent.columnconfigure(1, weight=1)
         r = 0
 
-        ttk.Label(parent, text="Degree:").grid(row=r, column=0, sticky=tk.W, pady=2)
-        self._degree_var = tk.IntVar(value=3)
-        ttk.Spinbox(parent, from_=1, to=30, textvariable=self._degree_var, width=8).grid(
-            row=r, column=1, sticky=tk.W, padx=4)
+        # --- Fit Region ---
+        region_lf = ttk.LabelFrame(parent, text="Fit Region", padding=4)
+        region_lf.grid(row=r, column=0, columnspan=2, sticky=tk.EW, pady=(0, 6))
+        region_lf.columnconfigure(1, weight=1)
         r += 1
 
-        ttk.Label(parent, text="Mode:").grid(row=r, column=0, sticky=tk.W, pady=2)
-        mf = ttk.Frame(parent)
-        mf.grid(row=r, column=1, sticky=tk.W)
+        # Region mode row
+        mode_row = ttk.Frame(region_lf)
+        mode_row.grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=2)
+        ttk.Label(mode_row, text="Mode:").pack(side=tk.LEFT)
         self._mode_var = tk.StringVar(value="full")
-        self._mode_full_rb = ttk.Radiobutton(mf, text="Full", variable=self._mode_var, value="full")
-        self._mode_full_rb.pack(side=tk.LEFT)
-        self._mode_trace_rb = ttk.Radiobutton(mf, text="Trace", variable=self._mode_var, value="trace")
+        self._mode_full_rb = ttk.Radiobutton(mode_row, text="Full", variable=self._mode_var, value="full")
+        self._mode_full_rb.pack(side=tk.LEFT, padx=(4, 0))
+        self._mode_trace_rb = ttk.Radiobutton(mode_row, text="Trace", variable=self._mode_var, value="trace")
         self._mode_trace_rb.pack(side=tk.LEFT)
-        r += 1
+        self._make_help_btn(mode_row,
+            "Full: regions are absolute column indices.\n"
+            "Trace: the bounding box of all regions is interpreted relative to the traced centre column.").pack(side=tk.LEFT, padx=(4, 0))
 
-        ttk.Label(parent, text="Start col:").grid(row=r, column=0, sticky=tk.W, pady=2)
-        self._start_var = tk.IntVar(value=0)
-        ttk.Spinbox(parent, from_=0, to=99999, textvariable=self._start_var, width=8).grid(
-            row=r, column=1, sticky=tk.W, padx=4)
-        r += 1
+        # Regions listbox
+        lb_frame = ttk.Frame(region_lf)
+        lb_frame.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(4, 2))
+        lb_frame.columnconfigure(0, weight=1)
+        self._regions_listbox = tk.Listbox(lb_frame, height=4, selectmode=tk.SINGLE,
+                                            font=("TkDefaultFont", 9))
+        self._regions_listbox.grid(row=0, column=0, sticky=tk.EW)
+        lb_scroll = ttk.Scrollbar(lb_frame, orient=tk.VERTICAL,
+                                   command=self._regions_listbox.yview)
+        lb_scroll.grid(row=0, column=1, sticky=tk.NS)
+        self._regions_listbox.config(yscrollcommand=lb_scroll.set)
 
-        ttk.Label(parent, text="Stop col:").grid(row=r, column=0, sticky=tk.W, pady=2)
-        self._stop_var = tk.IntVar(value=100)
-        ttk.Spinbox(parent, from_=1, to=99999, textvariable=self._stop_var, width=8).grid(
-            row=r, column=1, sticky=tk.W, padx=4)
-        r += 1
+        # Manual entry row
+        entry_row = ttk.Frame(region_lf)
+        entry_row.grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=2)
+        self._region_entry_var = tk.StringVar(value="")
+        ttk.Entry(entry_row, textvariable=self._region_entry_var, width=10).pack(side=tk.LEFT)
+        ttk.Button(entry_row, text="Add", command=self._add_region_manual).pack(
+            side=tk.LEFT, padx=(4, 0))
+        self._make_help_btn(entry_row,
+            "Type a region as  start-stop  (e.g. 100-250 or 100 250)\n"
+            "then click Add to append it to the list.").pack(side=tk.LEFT, padx=(4, 0))
 
-        ttk.Label(parent, text="Offset (trace):").grid(row=r, column=0, sticky=tk.W, pady=2)
+        # Select region on image button
+        sel_row = ttk.Frame(region_lf)
+        sel_row.grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(6, 2))
+        self._region_click_btn = ttk.Button(
+            sel_row, text="Select region on image",
+            command=self._start_region_click)
+        self._region_click_btn.pack(side=tk.LEFT)
+        self._region_click_status_var = tk.StringVar(value="")
+        ttk.Label(sel_row, textvariable=self._region_click_status_var,
+                  font=("TkDefaultFont", 8), foreground="gray").pack(side=tk.LEFT, padx=(6, 0))
+        self._make_help_btn(sel_row,
+            "Click this button, then click two points on the 2D image to add a region.\n\n"
+            "Background mode: adds a new fit region.\n"
+            "Profile mode: sets the extraction aperture low/high bounds and switches to Custom bounds.\n"
+            "Right-click on the image to remove the nearest background region.").pack(side=tk.LEFT, padx=(4, 0))
+
+        # Remove / Clear buttons
+        rmv_row = ttk.Frame(region_lf)
+        rmv_row.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=2)
+        ttk.Button(rmv_row, text="Remove selected",
+                   command=self._remove_selected_region).pack(side=tk.LEFT)
+        ttk.Button(rmv_row, text="Clear all",
+                   command=lambda: (self._fit_regions.clear(),
+                                    self._refresh_regions_listbox(),
+                                    self._draw_extr_region_lines())).pack(side=tk.LEFT, padx=(6, 0))
+
+        # Offset row
+        offset_row = ttk.Frame(region_lf)
+        offset_row.grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=2)
+        ttk.Label(offset_row, text="Offset (trace):").pack(side=tk.LEFT)
         self._offset_var = tk.IntVar(value=0)
-        ttk.Spinbox(parent, from_=-9999, to=9999, textvariable=self._offset_var, width=8).grid(
-            row=r, column=1, sticky=tk.W, padx=4)
-        r += 1
+        ttk.Spinbox(offset_row, from_=-9999, to=9999, textvariable=self._offset_var, width=8).pack(
+            side=tk.LEFT, padx=4)
+        self._make_help_btn(offset_row,
+            "Shift the trace centre by this many columns before computing the fit window.\n"
+            "Only active in Trace mode.").pack(side=tk.LEFT)
 
-        # --- Trace definition — must be set before fitting in trace mode ---
-        trace_lf = ttk.LabelFrame(parent, text="Trace Definition  (trace mode only)", padding=4)
-        trace_lf.grid(row=r, column=0, columnspan=2, sticky=tk.EW, pady=(6, 2))
+        trace_lf = ttk.LabelFrame(region_lf, text="Trace Definition  (trace mode only)", padding=4)
+        trace_lf.grid(row=6, column=0, columnspan=2, sticky=tk.EW, pady=(6, 2))
         trace_lf.columnconfigure(1, weight=1)
-        r += 1
 
-        ttk.Label(trace_lf, text="Poly coeffs\n(np.polyval order):",
-                  font=("TkDefaultFont", 8)).grid(row=0, column=0, sticky=tk.W, padx=(0, 4))
+        coeff_row = ttk.Frame(trace_lf)
+        coeff_row.grid(row=0, column=0, columnspan=2, sticky=tk.EW)
+        ttk.Label(coeff_row, text="Poly coeffs:",
+                  font=("TkDefaultFont", 8)).pack(side=tk.LEFT)
         self._trace_coeffs_var = tk.StringVar(value="")
-        ttk.Entry(trace_lf, textvariable=self._trace_coeffs_var, width=22).grid(
-            row=0, column=1, sticky=tk.EW)
+        ttk.Entry(coeff_row, textvariable=self._trace_coeffs_var, width=20).pack(
+            side=tk.LEFT, padx=4)
+        self._make_help_btn(coeff_row,
+            "Polynomial coefficients in np.polyval order (highest power first).\n\n"
+            'Examples:\n  "512"        → constant centre at column 512\n'
+            '  "0.05, 512"  → centre = 0.05·row + 512 (linear tilt)').pack(side=tk.LEFT)
+
         ttk.Button(trace_lf, text="Apply Trace",
                    command=self._apply_trace_coeffs).grid(
             row=1, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
@@ -551,52 +649,139 @@ class SpectrumApp(tk.Tk):
         ttk.Label(trace_lf, textvariable=self._trace_status_var,
                   font=("TkDefaultFont", 8), foreground="gray").grid(
             row=2, column=0, columnspan=2, sticky=tk.W)
-        ttk.Label(trace_lf,
-                  text='e.g. "0.05, 512"  →  linear  |  "512"  →  constant',
-                  font=("TkDefaultFont", 7), foreground="gray").grid(
-            row=3, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
 
-        ttk.Separator(parent, orient=tk.HORIZONTAL).grid(
-            row=r, column=0, columnspan=2, sticky=tk.EW, pady=6)
+        # --- Sigma Clipping ---
+        clip_lf = ttk.LabelFrame(parent, text="Sigma Clipping  (background & profile)", padding=4)
+        clip_lf.grid(row=r, column=0, columnspan=2, sticky=tk.EW, pady=(0, 4))
+        clip_lf.columnconfigure(1, weight=1)
         r += 1
 
+        clip_lf.columnconfigure(2, weight=1)
         self._sigma_clip_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(parent, text="Sigma Clipping", variable=self._sigma_clip_var).grid(
-            row=r, column=0, columnspan=2, sticky=tk.W, pady=2)
-        r += 1
+        clip_en_row = ttk.Frame(clip_lf)
+        clip_en_row.grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=2)
+        ttk.Checkbutton(clip_en_row, text="Enable", variable=self._sigma_clip_var).pack(side=tk.LEFT)
+        self._make_help_btn(clip_en_row,
+            "Enable iterative sigma clipping during fitting.\n\n"
+            "Background mode: clips residuals above/below sigma thresholds.\n"
+            "Profile mode: uses the Sigma upper value as a symmetric rejection threshold.").pack(side=tk.LEFT, padx=(4, 0))
 
-        ttk.Label(parent, text="Sigma upper:").grid(row=r, column=0, sticky=tk.W, pady=2)
+        ttk.Label(clip_lf, text="Sigma upper:").grid(row=1, column=0, sticky=tk.W, pady=2)
         self._sigma_upper_var = tk.DoubleVar(value=3.0)
-        ttk.Spinbox(parent, from_=0.5, to=20.0, increment=0.5,
+        ttk.Spinbox(clip_lf, from_=0.5, to=20.0, increment=0.5,
                     textvariable=self._sigma_upper_var, width=8).grid(
-            row=r, column=1, sticky=tk.W, padx=4)
-        r += 1
+            row=1, column=1, sticky=tk.W, padx=4)
+        self._make_help_btn(clip_lf,
+            "Reject pixels more than this many standard deviations above the fit.\n"
+            "Also used as the symmetric threshold in Profile mode.").grid(
+            row=1, column=2, sticky=tk.W)
 
-        ttk.Label(parent, text="Sigma lower:").grid(row=r, column=0, sticky=tk.W, pady=2)
+        ttk.Label(clip_lf, text="Sigma lower:").grid(row=2, column=0, sticky=tk.W, pady=2)
         self._sigma_lower_var = tk.DoubleVar(value=3.0)
-        ttk.Spinbox(parent, from_=0.5, to=20.0, increment=0.5,
+        ttk.Spinbox(clip_lf, from_=0.5, to=20.0, increment=0.5,
                     textvariable=self._sigma_lower_var, width=8).grid(
-            row=r, column=1, sticky=tk.W, padx=4)
-        r += 1
+            row=2, column=1, sticky=tk.W, padx=4)
+        self._make_help_btn(clip_lf,
+            "Reject pixels more than this many standard deviations below the fit.\n"
+            "(Background mode only; Profile mode uses Sigma upper symmetrically.)").grid(
+            row=2, column=2, sticky=tk.W)
 
-        ttk.Label(parent, text="Max iterations:").grid(row=r, column=0, sticky=tk.W, pady=2)
+        ttk.Label(clip_lf, text="Max iterations:").grid(row=3, column=0, sticky=tk.W, pady=2)
         self._max_iters_var = tk.IntVar(value=3)
-        ttk.Spinbox(parent, from_=1, to=50, textvariable=self._max_iters_var, width=8).grid(
-            row=r, column=1, sticky=tk.W, padx=4)
-        r += 1
+        ttk.Spinbox(clip_lf, from_=1, to=50, textvariable=self._max_iters_var, width=8).grid(
+            row=3, column=1, sticky=tk.W, padx=4)
+        self._make_help_btn(clip_lf,
+            "Maximum number of sigma-clipping iterations per row.\n"
+            "Fitting stops early if no new pixels are rejected.").grid(
+            row=3, column=2, sticky=tk.W)
+
+        # Connect shared vars to the mid-fit change handler
+        for var in (self._offset_var,
+                    self._sigma_upper_var, self._sigma_lower_var,
+                    self._max_iters_var, self._sigma_clip_var):
+            var.trace_add("write", self._on_param_change)
+
+        # Redraw region lines when offset changes
+        self._offset_var.trace_add("write", lambda *_: self._draw_extr_region_lines())
+
+    # ------------------------------------------------------------------
+    # Fit-region list helpers
+    # ------------------------------------------------------------------
+
+    def _refresh_regions_listbox(self):
+        self._regions_listbox.delete(0, tk.END)
+        for lo, hi in self._fit_regions:
+            self._regions_listbox.insert(tk.END, f"col {lo} – {hi}")
+
+    def _add_region_manual(self):
+        import re
+        text = self._region_entry_var.get().strip()
+        m = re.match(r"(\d+)\s*[-,\s]\s*(\d+)", text)
+        if not m:
+            self._status_var.set("Enter region as  start-stop  e.g.  100-250")
+            return
+        lo, hi = int(m.group(1)), int(m.group(2))
+        if lo >= hi:
+            lo, hi = hi, lo
+        self._fit_regions.append((lo, hi))
+        self._fit_regions.sort()
+        self._region_entry_var.set("")
+        self._refresh_regions_listbox()
+        self._draw_extr_region_lines()
+        self._status_var.set(f"Added region col {lo} – {hi}.")
+
+    def _remove_selected_region(self):
+        sel = self._regions_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        lo, hi = self._fit_regions.pop(idx)
+        self._refresh_regions_listbox()
+        self._draw_extr_region_lines()
+        self._status_var.set(f"Removed region col {lo} – {hi}.")
+
+    def _remove_region_at_col(self, col: int):
+        if not self._fit_regions:
+            return
+        # prefer a region that contains the click column
+        for i, (lo, hi) in enumerate(self._fit_regions):
+            if lo <= col <= hi:
+                self._fit_regions.pop(i)
+                self._refresh_regions_listbox()
+                self._draw_extr_region_lines()
+                self._status_var.set(f"Removed region col {lo} – {hi}.")
+                return
+        # else remove the region with the nearest boundary
+        nearest = min(range(len(self._fit_regions)),
+                      key=lambda i: min(abs(col - self._fit_regions[i][0]),
+                                        abs(col - self._fit_regions[i][1])))
+        lo, hi = self._fit_regions.pop(nearest)
+        self._refresh_regions_listbox()
+        self._draw_extr_region_lines()
+        self._status_var.set(f"Removed region col {lo} – {hi}.")
+
+    def _build_fit_params_tab(self, parent):
+        parent.columnconfigure(1, weight=1)
+        parent.columnconfigure(2, weight=0)
 
         ttk.Label(parent,
-                  text="Full: start/stop are column indices.\n"
-                       "Trace: start/stop are pixels below/above the trace centre.",
-                  font=("TkDefaultFont", 8), foreground="gray").grid(
-            row=r, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
-        r += 1
+                  text="Chebyshev polynomial background subtraction.\n"
+                       "Fits a polynomial to unmasked columns in each row,\n"
+                       "then subtracts it to produce the background-subtracted 2D spectrum.",
+                  font=("TkDefaultFont", 10), foreground="#555555").grid(
+            row=0, column=0, columnspan=3, sticky=tk.W, pady=(2, 10))
 
-        # Connect all fitting-parameter vars to the mid-fit change handler
-        for var in (self._degree_var, self._start_var, self._stop_var, self._offset_var,
-                    self._sigma_upper_var, self._sigma_lower_var, self._max_iters_var,
-                    self._sigma_clip_var):
-            var.trace_add("write", self._on_param_change)
+        deg_row = ttk.Frame(parent)
+        deg_row.grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=2)
+        ttk.Label(deg_row, text="Degree:", font=("TkDefaultFont", 10)).pack(side=tk.LEFT)
+        self._degree_var = tk.IntVar(value=3)
+        ttk.Spinbox(deg_row, from_=1, to=30, textvariable=self._degree_var, width=8).pack(
+            side=tk.LEFT, padx=4)
+        self._make_help_btn(deg_row,
+            "Degree of the Chebyshev polynomial fitted to background columns.\n\n"
+            "Low values (1–3) give smooth, broad backgrounds.\n"
+            "Higher values track narrower features but risk overfitting.").pack(side=tk.LEFT)
+        self._degree_var.trace_add("write", self._on_param_change)
 
     def _build_mask_tab(self, parent):
         self._bp_status_var = tk.StringVar(value="Bad pixel mode: OFF")
@@ -604,9 +789,14 @@ class SpectrumApp(tk.Tk):
         ttk.Button(parent, text="Toggle Bad Pixel Mode (B)",
                    command=self._toggle_bad_pixel_mode).pack(anchor=tk.W, pady=4)
 
-        ttk.Label(parent, text="Click the image or row-fit plot to\n"
-                               "toggle individual pixels as bad.",
-                  font=("TkDefaultFont", 8), foreground="gray").pack(anchor=tk.W, pady=(0, 8))
+        bp_info_row = ttk.Frame(parent)
+        bp_info_row.pack(anchor=tk.W, pady=(0, 8))
+        ttk.Label(bp_info_row, text="Bad Pixel Mode").pack(side=tk.LEFT)
+        self._make_help_btn(bp_info_row,
+            "Activate Bad Pixel Mode (button above or press B), then click pixels on the image "
+            "or the row-fit plot to toggle them as bad.\n\n"
+            "Bad pixels are excluded from all fits and shown in red.\n"
+            "Press D to toggle the pixel under the cursor without entering full bad-pixel mode.").pack(side=tk.LEFT, padx=(4, 0))
 
         ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
         ttk.Button(parent, text="Clear Manual Mask — Current Row",
@@ -748,15 +938,19 @@ class SpectrumApp(tk.Tk):
         self.centers = None
         self._trace_line = None
         self.ivar = None
+        self._var_file_var.set("")
+        self._var_status_var.set("No variance loaded — uniform weights used.")
         self.flux_1d = None
         self.err_1d = None
         self.current_row = 0
-        self._extr_click_state = 0
+        self._region_click_state = 0
         self._extr_vlines = []
         self._trace_status_var.set("No trace defined.")
         self._mode_var.set("full")
 
-        self._stop_var.set(n_cols)
+        self._fit_regions = []
+        self._refresh_regions_listbox()
+        self._region_click_lo = None
         self._n_rows_label.config(text=f"/ {n_rows - 1}")
         self.title(f"2D Spectrum Fitter — {os.path.basename(path)}")
         self._status_var.set(f"Loaded: {path}  |  {n_rows} rows × {n_cols} cols")
@@ -784,7 +978,8 @@ class SpectrumApp(tk.Tk):
         self.flux_1d = None
         self.err_1d = None
         self.current_row = 0
-        self._stop_var.set(n_cols)
+        self._fit_regions = []
+        self._refresh_regions_listbox()
         self._n_rows_label.config(text=f"/ {n_rows - 1}")
         self._status_var.set(
             f"Transposed  |  {n_rows} rows × {n_cols} cols"
@@ -946,6 +1141,7 @@ class SpectrumApp(tk.Tk):
         n_cr = int(self.cr_mask.sum())
         self._cr_status_var.set(f"CR mask: {n_cr} pixels flagged.")
         self._status_var.set(f"lacosmic done — {n_cr} cosmic ray pixels flagged.")
+        self._invalidate_all_fits()
         self._redraw_mask_overlay()
         self._redraw_current_row()
 
@@ -956,8 +1152,16 @@ class SpectrumApp(tk.Tk):
         self.cr_unmask = None
         self._cr_status_var.set("No CR mask.")
         self._status_var.set("Cosmic ray mask cleared.")
+        self._invalidate_all_fits()
         self._redraw_mask_overlay()
         self._redraw_current_row()
+
+    def _invalidate_all_fits(self):
+        """Discard all stored fit results so rows are re-fitted with the current mask."""
+        if self.results:
+            self.results = [None] * len(self.results)
+        if self.profile_fit_cache is not None:
+            self.profile_fit_cache = [None] * len(self.profile_fit_cache)
 
     # ------------------------------------------------------------------
     # Contrast controls
@@ -1140,35 +1344,59 @@ class SpectrumApp(tk.Tk):
     # Fitting
     # ------------------------------------------------------------------
 
-    def _get_fit_region(self, row_idx: int):
+    def _get_bkg_regions(self, row_idx: int) -> list:
+        """Return validated list of (start_col, stop_col) for background fitting.
+        Falls back to the full row when no regions are defined."""
+        if self.trace is None:
+            return []
         n_cols = self.trace.shape[1]
-        if self._mode_var.get() == "full":
-            start_idx = int(np.clip(self._start_var.get(), 0, n_cols - 2))
-            stop_idx = int(np.clip(self._stop_var.get(), start_idx + 1, n_cols))
+        if not self._fit_regions:
+            return [(0, n_cols)]
+        result = []
+        for lo, hi in self._fit_regions:
+            s = int(np.clip(lo, 0, n_cols - 2))
+            e = int(np.clip(hi, s + 1, n_cols))
+            result.append((s, e))
+        return result
+
+    def _get_fit_region(self, row_idx: int):
+        """Single (start, stop) for profile extraction aperture — bounding box of fit regions."""
+        n_cols = self.trace.shape[1]
+        if self._fit_regions:
+            lo = min(s for s, e in self._fit_regions)
+            hi = max(e for s, e in self._fit_regions)
         else:
-            center = (float(self.centers[row_idx]) if self.centers is not None
-                      else n_cols / 2.0)
-            center = int(round(center + self._offset_var.get()))
-            below = max(1, self._start_var.get())
-            above = max(1, self._stop_var.get())
-            start_idx = int(np.clip(center - below, 0, n_cols - 1))
-            stop_idx = int(np.clip(center + above + 1, start_idx + 1, n_cols))
-        return start_idx, stop_idx
+            lo, hi = 0, n_cols
+        if self._mode_var.get() == "trace" and self.centers is not None:
+            center = int(round(float(self.centers[row_idx]) + self._offset_var.get()))
+            half = max(1, (hi - lo) // 2)
+            lo = int(np.clip(center - half, 0, n_cols - 1))
+            hi = int(np.clip(center + half + 1, lo + 1, n_cols))
+        else:
+            lo = int(np.clip(lo, 0, n_cols - 2))
+            hi = int(np.clip(hi, lo + 1, n_cols))
+        return lo, hi
 
     def _fit_row(self, row_idx: int) -> dict:
         n_cols = self.trace.shape[1]
         degree = self._degree_var.get()
         x = np.arange(n_cols)
         y = self.trace[row_idx]
-        start_idx, stop_idx = self._get_fit_region(row_idx)
-
-        x_fit = x[start_idx:stop_idx]
-        y_fit = y[start_idx:stop_idx]
         combined = self._combined_mask()
-        region_mask = ~combined[row_idx, start_idx:stop_idx]  # True = good pixel
 
+        regions = self._get_bkg_regions(row_idx)
+        bnd_start = min(s for s, e in regions) if regions else 0
+        bnd_stop  = max(e for s, e in regions) if regions else n_cols
         empty = {"cheb": None, "model": None, "residual": None,
-                 "outlier_mask": None, "start_idx": start_idx, "stop_idx": stop_idx}
+                 "outlier_mask": None, "start_idx": bnd_start, "stop_idx": bnd_stop,
+                 "regions": regions}
+
+        if not regions:
+            return empty
+
+        x_fit = np.concatenate([x[s:e] for s, e in regions])
+        y_fit = np.concatenate([y[s:e] for s, e in regions])
+        region_mask = np.concatenate([~combined[row_idx, s:e] for s, e in regions])
 
         if region_mask.sum() <= degree:
             return empty
@@ -1194,18 +1422,17 @@ class SpectrumApp(tk.Tk):
         y_model = cheb(x)
         residual = y - y_model
 
-        # Map local outlier indices back to full column indices
         outlier_full = np.zeros(n_cols, dtype=bool)
-        valid_col_indices = np.where(region_mask)[0] + start_idx
-        outlier_full[valid_col_indices[outlier_local]] = True
+        outlier_full[x_valid[outlier_local]] = True
 
         return {
             "cheb": cheb,
             "model": y_model,
             "residual": residual,
             "outlier_mask": outlier_full,
-            "start_idx": start_idx,
-            "stop_idx": stop_idx,
+            "start_idx": bnd_start,
+            "stop_idx": bnd_stop,
+            "regions": regions,
         }
 
     def _fit_current_row(self, update_image: bool = True):
@@ -1357,6 +1584,7 @@ class SpectrumApp(tk.Tk):
         else:
             self._mode_full_rb.config(state=tk.NORMAL)
             self._mode_trace_rb.config(state=tk.NORMAL)
+        self._region_click_btn.config(state=state)
 
     def _any_loop_running(self) -> bool:
         return self._fit_running or self._extr_running
@@ -1406,7 +1634,7 @@ class SpectrumApp(tk.Tk):
     # ------------------------------------------------------------------
 
     def _draw_extr_region_lines(self, redraw: bool = True):
-        """Draw two yellow dashed vertical lines showing the extraction aperture."""
+        """Draw yellow dashed vertical lines showing fit regions or extraction aperture."""
         for line in self._extr_vlines:
             try:
                 line.remove()
@@ -1420,34 +1648,47 @@ class SpectrumApp(tk.Tk):
             return
 
         n_cols = self.trace.shape[1]
-        if self._extr_region_var.get() == "custom":
-            try:
-                lo = int(self._extr_lo_var.get())
-                hi = int(self._extr_hi_var.get())
-            except (tk.TclError, ValueError):
-                return
-        else:
-            # "fit" mode — show where the aperture lands for the current row
-            lo, hi = self._get_fit_region(self.current_row)
+        is_profile = (self._fit_mode_var is not None and
+                      self._fit_mode_var.get() == "profile")
 
-        lo = max(0, min(lo, n_cols - 1))
-        hi = max(lo + 1, min(hi, n_cols))
-        l1 = self._img_ax.axvline(lo, color="yellow", lw=1.2, ls="--", alpha=0.85, zorder=5)
-        l2 = self._img_ax.axvline(hi, color="yellow", lw=1.2, ls="--", alpha=0.85, zorder=5)
-        self._extr_vlines = [l1, l2]
+        if is_profile:
+            if self._extr_region_var.get() == "custom":
+                try:
+                    lo = int(self._extr_lo_var.get())
+                    hi = int(self._extr_hi_var.get())
+                except (tk.TclError, ValueError):
+                    return
+            else:
+                lo, hi = self._get_fit_region(self.current_row)
+            lo = max(0, min(lo, n_cols - 1))
+            hi = max(lo + 1, min(hi, n_cols))
+            l1 = self._img_ax.axvline(lo, color="yellow", lw=1.2, ls="--", alpha=0.85, zorder=5)
+            l2 = self._img_ax.axvline(hi, color="yellow", lw=1.2, ls="--", alpha=0.85, zorder=5)
+            self._extr_vlines = [l1, l2]
+        else:
+            for lo, hi in self._fit_regions:
+                lo = max(0, min(lo, n_cols - 1))
+                hi = max(lo + 1, min(hi, n_cols))
+                l1 = self._img_ax.axvline(lo, color="yellow", lw=1.2, ls="--", alpha=0.85, zorder=5)
+                l2 = self._img_ax.axvline(hi, color="yellow", lw=1.2, ls="--", alpha=0.85, zorder=5)
+                self._extr_vlines.extend([l1, l2])
+
         if redraw:
             self._img_canvas.draw_idle()
 
-    def _start_extr_click_region(self):
-        """Activate two-click mode to set the extraction aperture on the image."""
+    def _start_region_click(self):
+        """Activate two-click mode to select the fit region on the image.
+
+        In background mode updates Start/Stop col; in profile mode updates the
+        extraction aperture lo/hi and switches to custom bounds.
+        """
         if self.trace is None:
             messagebox.showwarning("No data", "Load a FITS file first.")
             return
-        self._extr_region_var.set("custom")
-        self._extr_click_state = 1
-        self._extr_click_btn.config(text="Click lower bound on image…")
-        self._extr_click_status_var.set("Click lower (left) column boundary.")
-        self._status_var.set("Extraction aperture: click the lower column boundary on the image.")
+        self._region_click_state = 1
+        self._region_click_btn.config(text="Click lower bound on image…")
+        self._region_click_status_var.set("Click lower (left) column boundary.")
+        self._status_var.set("Select region: click the lower column boundary on the image.")
 
     # ------------------------------------------------------------------
     # Parameter-change guard during fitting
@@ -1509,45 +1750,63 @@ class SpectrumApp(tk.Tk):
         ax1.clear()
         ax2.clear()
 
-        # Raw data
-        ax1.plot(x, y, color="0.3", lw=0.8, label="Data")
-
-        # Manual/file bad pixels
-        if bad.any():
-            ax1.scatter(x[bad], y[bad], marker="x", color="purple",
-                        s=50, zorder=5, linewidths=1.5, label="Bad pixel")
-
         has_fit = result is not None and result.get("model") is not None
+
         if has_fit:
-            start_idx = result["start_idx"]
-            stop_idx = result["stop_idx"]
             model = result["model"]
             residual = result["residual"]
             outlier = result.get("outlier_mask")
+            regions = result.get("regions") or [(result["start_idx"], result["stop_idx"])]
 
-            ax1.plot(x, model, color="C1", lw=1.3, label="Model")
-            ax1.axvspan(start_idx, stop_idx, color="C0", alpha=0.12, label="Fit region")
+            all_s = min(s for s, e in regions)
+            all_e = max(e for s, e in regions)
+            pad = max(2, (all_e - all_s) // 20)
 
-            if outlier is not None and outlier.any():
-                ax1.scatter(x[outlier], y[outlier], marker="o",
-                            edgecolors="red", facecolors="none",
-                            s=70, zorder=6, linewidths=1.5, label="Clipped")
-
-            ax2.plot(x, residual, color="C3", lw=0.8)
+            # Full span: data and residual as one continuous line
+            ax1.plot(x[all_s:all_e], y[all_s:all_e], color="0.3", lw=0.8, label="Data")
+            ax2.plot(x[all_s:all_e], residual[all_s:all_e], color="C3", lw=0.8)
             ax2.axhline(0, color="0.5", lw=0.8, ls="--")
 
-            if outlier is not None and outlier.any():
-                ax2.scatter(x[outlier], residual[outlier], marker="o",
-                            edgecolors="red", facecolors="none",
+            # Model across full span
+            ax1.plot(x[all_s:all_e], model[all_s:all_e], color="C1", lw=1.3, label="Model")
+
+            # Highlight selected regions
+            for s, e in regions:
+                ax1.axvspan(s, e, color="C0", alpha=0.18, label="_nolegend_")
+                ax2.axvspan(s, e, color="C0", alpha=0.18, label="_nolegend_")
+
+            # Bad pixel markers across full span
+            bads_span = bad[all_s:all_e]
+            if bads_span.any():
+                ax1.scatter(x[all_s:all_e][bads_span], y[all_s:all_e][bads_span],
+                            marker="x", color="purple", s=50, zorder=5,
+                            linewidths=1.5, label="Bad pixel")
+
+            # Sigma-clipped outlier markers
+            if outlier is not None and outlier[all_s:all_e].any():
+                ol_span = outlier[all_s:all_e]
+                ax1.scatter(x[all_s:all_e][ol_span], y[all_s:all_e][ol_span],
+                            marker="o", edgecolors="red", facecolors="none",
+                            s=70, zorder=6, linewidths=1.5, label="Clipped")
+                ax2.scatter(x[all_s:all_e][ol_span], residual[all_s:all_e][ol_span],
+                            marker="o", edgecolors="red", facecolors="none",
                             s=70, zorder=6, linewidths=1.5)
 
-            n_clipped = int(outlier.sum()) if outlier is not None else 0
-            n_bad = int(bad.sum())
+            ax1.set_xlim(all_s - pad, all_e + pad)
+            ax2.set_xlim(all_s - pad, all_e + pad)
+
+            n_clipped = int(outlier[all_s:all_e].sum()) if outlier is not None else 0
+            n_bad = int(bad[all_s:all_e].sum())
             ax1.set_title(
                 f"Row {row_idx}  |  clipped: {n_clipped}  bad pixels: {n_bad}",
                 fontsize=9,
             )
         else:
+            # No fit yet — show full row
+            ax1.plot(x, y, color="0.3", lw=0.8, label="Data")
+            if bad.any():
+                ax1.scatter(x[bad], y[bad], marker="x", color="purple",
+                            s=50, zorder=5, linewidths=1.5, label="Bad pixel")
             msg = "No fit yet" if result is None else "Fit region too small / insufficient good pixels"
             ax1.set_title(f"Row {row_idx}  —  {msg}", fontsize=9)
 
@@ -1724,32 +1983,65 @@ class SpectrumApp(tk.Tk):
     def _on_image_click(self, event):
         if event.inaxes != self._img_ax or self.trace is None:
             return
+        if event.xdata is None or event.ydata is None:
+            return
         col = int(round(event.xdata))
         row = int(round(event.ydata))
         n_rows, n_cols = self.trace.shape
         if not (0 <= col < n_cols and 0 <= row < n_rows):
             return
 
-        # Extraction aperture click mode takes priority
-        if self._extr_click_state in (1, 2):
-            if self._extr_click_state == 1:
-                self._extr_lo_var.set(col)
-                self._extr_click_state = 2
-                self._extr_click_btn.config(text="Click upper bound on image…")
-                self._extr_click_status_var.set("Click upper (right) column boundary.")
-                self._status_var.set("Extraction aperture: now click the upper column boundary.")
+        # Right-click: remove nearest background region
+        if event.button == 3:
+            is_profile = (self._fit_mode_var is not None and
+                          self._fit_mode_var.get() == "profile")
+            if not is_profile:
+                self._remove_region_at_col(col)
+            return
+
+        # Shared region-select click mode (background: adds region; profile: updates aperture)
+        if self._region_click_state in (1, 2):
+            is_profile = (self._fit_mode_var is not None and
+                          self._fit_mode_var.get() == "profile")
+            if self._region_click_state == 1:
+                if is_profile:
+                    self._extr_lo_var.set(col)
+                    self._extr_region_var.set("custom")
+                else:
+                    self._region_click_lo = col
+                self._region_click_state = 2
+                self._region_click_btn.config(text="Click upper bound on image…")
+                self._region_click_status_var.set("Click upper (right) column boundary.")
+                self._status_var.set("Select region: now click the upper column boundary.")
             else:
-                hi = col
-                lo = self._extr_lo_var.get()
-                if hi < lo:
-                    lo, hi = hi, lo
-                self._extr_lo_var.set(lo)
-                self._extr_hi_var.set(hi)
-                self._extr_click_state = 0
-                self._extr_click_btn.config(text="Click two lines on image")
-                self._extr_click_status_var.set(f"Aperture set: col {lo} – {hi}")
-                self._status_var.set(f"Extraction aperture set to columns {lo} – {hi}.")
+                if is_profile:
+                    lo = self._extr_lo_var.get()
+                    hi = col
+                    if hi < lo:
+                        lo, hi = hi, lo
+                    self._extr_lo_var.set(lo)
+                    self._extr_hi_var.set(hi)
+                    self._extr_region_var.set("custom")
+                    label = f"Aperture set: col {lo} – {hi}"
+                    msg = f"Extraction aperture set to columns {lo} – {hi}."
+                else:
+                    lo = self._region_click_lo if self._region_click_lo is not None else 0
+                    hi = col
+                    if hi < lo:
+                        lo, hi = hi, lo
+                    self._fit_regions.append((lo, hi))
+                    self._fit_regions.sort()
+                    self._refresh_regions_listbox()
+                    label = f"Added region: col {lo} – {hi}"
+                    msg = f"Region col {lo} – {hi} added. Click 'Select region' again for another."
+                self._region_click_lo = None
+                self._region_click_state = 0
+                self._region_click_btn.config(text="Select region on image")
+                self._region_click_status_var.set(label)
+                self._status_var.set(msg)
                 self._draw_extr_region_lines()
+                if not is_profile and self._autofit_var.get():
+                    self._fit_mode_current_row(update_image=False)
             return
 
         if self.bad_pixel_mode:
@@ -1873,11 +2165,16 @@ class SpectrumApp(tk.Tk):
         var_lf.columnconfigure(1, weight=1)
         r += 1
 
+        var_type_row = ttk.Frame(var_lf)
+        var_type_row.grid(row=0, column=0, columnspan=2, sticky=tk.W)
         self._var_type_var = tk.StringVar(value="ivar")
-        ttk.Radiobutton(var_lf, text="IVAR", variable=self._var_type_var, value="ivar").grid(
-            row=0, column=0, sticky=tk.W)
-        ttk.Radiobutton(var_lf, text="ERR", variable=self._var_type_var, value="err").grid(
-            row=0, column=1, sticky=tk.W)
+        ttk.Radiobutton(var_type_row, text="IVAR", variable=self._var_type_var, value="ivar").pack(side=tk.LEFT)
+        ttk.Radiobutton(var_type_row, text="ERR", variable=self._var_type_var, value="err").pack(side=tk.LEFT, padx=(8, 0))
+        self._make_help_btn(var_type_row,
+            "Select the type of uncertainty array stored in the FITS extension:\n\n"
+            "  IVAR  — inverse variance (1/σ²). Optimal extraction weights pixels by IVAR.\n"
+            "  ERR   — standard error (σ). Will be squared internally to produce IVAR.\n\n"
+            "If no variance is loaded, all pixels are given equal weight.").pack(side=tk.LEFT, padx=(6, 0))
 
         ttk.Button(var_lf, text="Load from current file",
                    command=self._load_variance_current).grid(
@@ -1902,41 +2199,33 @@ class SpectrumApp(tk.Tk):
         prof_lf.columnconfigure(1, weight=1)
         r += 1
 
-        ttk.Label(prof_lf, text="GH order N (2=Gaussian):").grid(row=0, column=0, sticky=tk.W)
+        gh_row = ttk.Frame(prof_lf)
+        gh_row.grid(row=0, column=0, columnspan=2, sticky=tk.W)
+        ttk.Label(gh_row, text="GH order N (2=Gaussian):").pack(side=tk.LEFT)
         self._gh_order_var = tk.IntVar(value=4)
-        ttk.Spinbox(prof_lf, from_=2, to=10, textvariable=self._gh_order_var, width=4).grid(
-            row=0, column=1, sticky=tk.W, padx=4)
+        ttk.Spinbox(gh_row, from_=2, to=10, textvariable=self._gh_order_var, width=4).pack(
+            side=tk.LEFT, padx=4)
+        self._make_help_btn(gh_row,
+            "Gauss-Hermite order N controls how many moments are fit:\n\n"
+            "  N=2  Gaussian only (amplitude, centre, width)\n"
+            "  N=3  +h3 (skewness)\n"
+            "  N=4  +h3, h4 (kurtosis)\n\n"
+            "Sigma clipping settings are in the Common tab.").pack(side=tk.LEFT)
 
-        self._extr_sigma_clip_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(prof_lf, text="Sigma clip profile",
-                        variable=self._extr_sigma_clip_var).grid(
-            row=1, column=0, columnspan=2, sticky=tk.W, pady=2)
-
-        ttk.Label(prof_lf, text="Sigma:").grid(row=2, column=0, sticky=tk.W)
-        self._extr_sigma_var = tk.DoubleVar(value=3.0)
-        ttk.Spinbox(prof_lf, from_=1.0, to=10.0, increment=0.5,
-                    textvariable=self._extr_sigma_var, width=6).grid(
-            row=2, column=1, sticky=tk.W, padx=4)
-
-        ttk.Label(prof_lf, text="Max iters:").grid(row=3, column=0, sticky=tk.W)
-        self._extr_max_iters_var = tk.IntVar(value=3)
-        ttk.Spinbox(prof_lf, from_=1, to=20, textvariable=self._extr_max_iters_var, width=6).grid(
-            row=3, column=1, sticky=tk.W, padx=4)
-
-        ttk.Label(prof_lf,
-                  text="0 = Gaussian  |  1 = +h3 (skew)  |  2 = +h3,h4 (kurtosis)",
-                  font=("TkDefaultFont", 7), foreground="gray").grid(
-            row=4, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
-
-        ttk.Label(prof_lf, text="At rejected pixels use:").grid(
-            row=5, column=0, sticky=tk.W, pady=(4, 0))
+        fill_row = ttk.Frame(prof_lf)
+        fill_row.grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
+        ttk.Label(fill_row, text="At rejected pixels use:").pack(side=tk.LEFT)
         self._rejection_fill_var = tk.StringVar(value="spline")
-        fill_frame = ttk.Frame(prof_lf)
-        fill_frame.grid(row=5, column=1, sticky=tk.W, pady=(4, 0))
-        ttk.Radiobutton(fill_frame, text="Spline interp",
-                        variable=self._rejection_fill_var, value="spline").pack(side=tk.LEFT)
-        ttk.Radiobutton(fill_frame, text="GH model",
+        ttk.Radiobutton(fill_row, text="Spline interp",
+                        variable=self._rejection_fill_var, value="spline").pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Radiobutton(fill_row, text="GH model",
                         variable=self._rejection_fill_var, value="model").pack(side=tk.LEFT, padx=(6, 0))
+        self._make_help_btn(fill_row,
+            "How to fill rejected (sigma-clipped) pixels before the optimal-extraction sum:\n\n"
+            "  Spline interp — interpolate from neighbouring good pixels along the column.\n"
+            "  GH model — substitute the best-fit Gauss-Hermite profile value.\n\n"
+            "Spline is usually safer when bad pixels cluster at the spectrum edge; "
+            "GH model is better when the profile is well-constrained.").pack(side=tk.LEFT, padx=(4, 0))
 
         # --- Extraction region ---
         reg_lf = ttk.LabelFrame(parent, text="Extraction Aperture", padding=4)
@@ -1967,21 +2256,12 @@ class SpectrumApp(tk.Tk):
         for v in (self._extr_lo_var, self._extr_hi_var):
             v.trace_add("write", lambda *_: self._draw_extr_region_lines())
 
-        self._extr_click_btn = ttk.Button(
-            reg_lf, text="Click two lines on image",
-            command=self._start_extr_click_region)
-        self._extr_click_btn.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
-
-        self._extr_click_status_var = tk.StringVar(value="")
-        ttk.Label(reg_lf, textvariable=self._extr_click_status_var,
-                  font=("TkDefaultFont", 8), foreground="gray").grid(
-            row=5, column=0, columnspan=2, sticky=tk.W)
-
-        ttk.Label(reg_lf,
-                  text="Yellow dashed lines on image show aperture.\n"
-                       "In trace mode the window follows the trace.",
-                  font=("TkDefaultFont", 7), foreground="gray").grid(
-            row=6, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+        aper_hint_row = ttk.Frame(reg_lf)
+        aper_hint_row.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+        self._make_help_btn(aper_hint_row,
+            "Yellow dashed lines on the image show the extraction aperture.\n\n"
+            "In Trace mode the aperture window follows the traced centre column per row.\n\n"
+            "Use 'Select region on image' in the Common tab to set bounds by clicking.").pack(side=tk.LEFT)
 
         # --- Save ---
         save_lf = ttk.LabelFrame(parent, text="Save", padding=4)
@@ -1990,9 +2270,10 @@ class SpectrumApp(tk.Tk):
 
         ttk.Button(save_lf, text="Save 1D FITS",
                    command=self._save_1d_fits).pack(side=tk.LEFT, padx=2)
-        ttk.Label(save_lf,
-                  text="Use Navigate & Fit tab to run extraction.",
-                  font=("TkDefaultFont", 8), foreground="gray").pack(side=tk.LEFT, padx=8)
+        self._make_help_btn(save_lf,
+            "Save the extracted 1D spectrum as a FITS file.\n\n"
+            "Output contains two extensions: FLUX and ERR.\n"
+            "Run 'Fit All Rows' in the Navigate & Fit tab first to produce results.").pack(side=tk.LEFT, padx=4)
 
     # ------------------------------------------------------------------
     # Variance loading
@@ -2106,9 +2387,9 @@ class SpectrumApp(tk.Tk):
 
         gh_order = self._gh_order_var.get()
         n_extra = max(0, gh_order - 2)   # number of h terms: h3, h4, ..., h_{gh_order}
-        do_clip = self._extr_sigma_clip_var.get()
-        n_sigma = self._extr_sigma_var.get()
-        max_iters = self._extr_max_iters_var.get()
+        do_clip = self._sigma_clip_var.get()
+        n_sigma = self._sigma_upper_var.get()
+        max_iters = self._max_iters_var.get()
 
         # Initial guess from weighted moments
         ypos = np.where(y > 0, y, 0.0)
@@ -2471,15 +2752,20 @@ class SpectrumApp(tk.Tk):
             messagebox.showinfo("No data", "No background fit results to display yet.")
             return
         n_cols = self.trace.shape[1]
-        model_rows = []
-        for r in self.results:
+        bkgsub_rows = []
+        for i, r in enumerate(self.results):
             if r is None or r.get("model") is None:
-                model_rows.append(np.full(n_cols, np.nan))
+                bkgsub_rows.append(np.full(n_cols, np.nan))
             else:
-                model_rows.append(r["model"])
-        model_arr = np.vstack(model_rows)
-        vmin, vmax = _zscale(model_arr[np.isfinite(model_arr)].reshape(-1, 1)
-                             if np.any(np.isfinite(model_arr)) else model_arr)
+                regions = r.get("regions") or [(r["start_idx"], r["stop_idx"])]
+                lo = min(s for s, e in regions)
+                hi = max(e for s, e in regions)
+                row_arr = np.zeros(n_cols)
+                row_arr[lo:hi] = self.trace[i, lo:hi] - r["model"][lo:hi]
+                bkgsub_rows.append(row_arr)
+        bkgsub_arr = np.vstack(bkgsub_rows)
+        finite_vals = bkgsub_arr[np.isfinite(bkgsub_arr)]
+        vmin, vmax = _zscale(finite_vals.reshape(-1, 1)) if finite_vals.size else (0.0, 1.0)
 
         # Reuse existing window if still open
         win_alive = (self._display_win_2d is not None and
@@ -2487,28 +2773,28 @@ class SpectrumApp(tk.Tk):
         if win_alive:
             ax = self._display_ax_2d
             ax.clear()
-            ax.imshow(model_arr, origin="lower", aspect="auto",
+            ax.imshow(bkgsub_arr, origin="lower", aspect="auto",
                       vmin=vmin, vmax=vmax, cmap="gray", interpolation="nearest")
             ax.set_xlabel("Column", fontsize=8)
             ax.set_ylabel("Row", fontsize=8)
-            ax.set_title("Chebyshev background model", fontsize=9)
+            ax.set_title("Background-subtracted spectrum", fontsize=9)
             self._display_canvas_2d.draw_idle()
             self._display_win_2d.lift()
             return
 
         win = tk.Toplevel(self)
-        win.title("Stored Background Model (2D)")
+        win.title("Background-subtracted Spectrum (2D)")
         win.geometry("900x500")
         self._display_win_2d = win
 
         fig = Figure(figsize=(9, 5), dpi=90)
         ax = fig.add_subplot(111)
         self._display_ax_2d = ax
-        ax.imshow(model_arr, origin="lower", aspect="auto",
+        ax.imshow(bkgsub_arr, origin="lower", aspect="auto",
                   vmin=vmin, vmax=vmax, cmap="gray", interpolation="nearest")
         ax.set_xlabel("Column", fontsize=8)
         ax.set_ylabel("Row", fontsize=8)
-        ax.set_title("Chebyshev background model", fontsize=9)
+        ax.set_title("Background-subtracted spectrum", fontsize=9)
         fig.tight_layout(pad=0.8)
 
         canvas = FigureCanvasTkAgg(fig, master=win)
