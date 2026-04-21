@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Purpose
 
-`spectrum_gui.py` is a single-file interactive GUI tool for astronomers to:
+`spec_fitter` is an interactive GUI tool for astronomers to:
 1. **Background-subtract** a 2D FITS spectrum by fitting a Chebyshev polynomial row-by-row, then saving the residual as a new FITS file.
 2. **Extract a 1D spectrum** from a 2D FITS image by fitting a Gauss-Hermite spatial profile per row (optimal extraction), then saving flux + error arrays as a FITS file.
 
@@ -18,18 +18,29 @@ pip install numpy matplotlib astropy scipy
 pip install astroscrappy   # cosmic ray removal via lacosmic
 
 # Launch
-python spectrum_gui.py                   # open blank, then use "Open FITS"
-python spectrum_gui.py /path/to/spec.fits  # load file on start
+python -m spec_fitter                        # open blank, then use "Open FITS"
+python -m spec_fitter /path/to/spec.fits     # load file on start
+spec-fitter                                  # if installed via pip install -e .
 ```
 
-There are no tests, build steps, or package setup.
+`spectrum_gui.py` at the repo root is a backward-compatibility shim that
+re-exports `SpectrumApp` and `main` from the package.
 
 ## Architecture
 
-The entire application lives in one class, `SpectrumApp(tk.Tk)`, in `spectrum_gui.py`. Three module-level helpers sit above it:
-- `_zscale` — image contrast scaling
-- `_fit_with_outliers` — iterative sigma-clipping Chebyshev fit (used for background mode)
-- `_hermite_poly_e` / `_gauss_hermite_profile` — probabilists' Hermite polynomials and the GH spatial profile (used for profile/extraction mode)
+### Package layout
+
+| File | Purpose |
+|------|---------|
+| `spec_fitter/app.py` | `SpectrumApp(tk.Tk)` — the entire UI and orchestration layer |
+| `spec_fitter/background.py` | `_zscale`, `_fit_with_outliers` — background subtraction maths |
+| `spec_fitter/profile.py` | `_hermite_poly_e`, `_gauss_hermite_profile` — Gauss-Hermite maths |
+| `spec_fitter/widgets.py` | `_ask_extension` — reusable tkinter dialog helpers |
+| `spec_fitter/__main__.py` | `main()` entry point |
+| `spectrum_gui.py` | Shim — `from spec_fitter.app import SpectrumApp` |
+
+**Adding a new algorithm**: create `spec_fitter/my_model.py` with pure
+functions, then import it in `app.py`.
 
 ### Data state (instance attributes)
 All persistent data lives directly on `self`. Key arrays:
@@ -72,7 +83,8 @@ Popup windows (`_display_win_2d`, `_display_win_1d`, `_display_win_centroid`) ar
 
 ## Adding Features
 
-- **New fit model**: add a helper function at module level (following `_fit_with_outliers`), add a mode option to `_fit_mode_var`, and wire dispatch into `_fit_mode_current_row` / `_fit_mode_start_all`.
+- **New background model**: add a pure function to `spec_fitter/background.py`, import it in `app.py`, add a mode option to `_fit_mode_var`, and wire dispatch into `_fit_mode_current_row` / `_fit_mode_start_all`.
+- **New spatial profile**: add a pure function to `spec_fitter/profile.py`, import it in `app.py`, wire it into `_fit_profile_row`.
 - **New mask layer**: add a `(n_rows, n_cols)` bool array attribute to `__init__`, include it in `_combined_mask` and `_display_mask`, reset it in `_load_fits` and `_transpose_data`.
 - **New output format**: add a save method patterned on `_save_results` or `_save_1d_fits`; add a button in the relevant tab or toolbar.
 - **New tab**: add a `_build_*_tab` method called from `_build_params_panel`; keep the pattern of `ttk.LabelFrame` groups within a `ttk.Frame`.

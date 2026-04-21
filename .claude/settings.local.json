@@ -8,7 +8,14 @@
       "Bash(python3 -c \"import astroscrappy; print\\('astroscrappy', astroscrappy.__version__\\)\")",
       "Bash(pip install *)",
       "Bash(spec-fitter --help)",
-      "Bash(python3 -c \"import spectrum_gui; print\\('OK'\\)\")"
+      "Bash(python3 -c \"import spectrum_gui; print\\('OK'\\)\")",
+      "Bash(python3 -c \"from spec_fitter.app import SpectrumApp; print\\('app OK'\\)\")",
+      "Bash(python3 -c \"from spec_fitter.background import _fit_with_outliers, _zscale; print\\('background OK'\\)\")",
+      "Bash(python3 -c \"from spec_fitter.profile import _gauss_hermite_profile; print\\('profile OK'\\)\")",
+      "Bash(python3 -c \"from spec_fitter.widgets import _ask_extension; print\\('widgets OK'\\)\")",
+      "Bash(python3 -c \"import spectrum_gui; print\\('shim OK'\\)\")",
+      "Bash(python3 -c \"from spec_fitter.profile import _gauss_hermite_profile, _hermite_poly_e; print\\('profile OK'\\)\")",
+      "Bash(python3 -c \"import spec_fitter; print\\('package __init__ OK'\\)\")"
     ]
   }
 }

@@ -36,11 +36,12 @@ lacosmic = [
 ]
 
 [project.scripts]
-spec-fitter = "spectrum_gui:main"
+spec-fitter = "spec_fitter.__main__:main"
 
 [project.urls]
 Repository = "https://github.com/PLACEHOLDER/spec_fitter"
 "Bug Tracker" = "https://github.com/PLACEHOLDER/spec_fitter/issues"
 
 [tool.setuptools]
+packages = ["spec_fitter"]
 py-modules = ["spectrum_gui"]
